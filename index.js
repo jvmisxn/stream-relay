@@ -39,10 +39,11 @@ async function checkRtmpInput() {
 
     const xml = await res.text();
     // Check if there's an active stream in the "live" application
-    // The nginx-rtmp stat page shows <stream><name>stream</name>...</stream> when active
-    const hasStream = xml.includes('<application><name>live</name>') &&
-                      xml.includes('<stream>') &&
-                      xml.includes('<name>stream</name>');
+    // Look for a publishing stream (has <publishing/> tag inside <stream>)
+    // The XML structure is: <application><name>live</name><live><stream>...<publishing/>...</stream></live></application>
+    const hasLiveApp = xml.includes('<name>live</name>');
+    const hasPublishingStream = xml.includes('<publishing/>') && xml.includes('<stream>');
+    const hasStream = hasLiveApp && hasPublishingStream;
 
     if (hasStream && !inputStartTime) {
       inputStartTime = Date.now();
@@ -55,6 +56,7 @@ async function checkRtmpInput() {
       startTime: inputStartTime
     };
   } catch (error) {
+    console.error('Failed to check RTMP input:', error.message);
     return { available: false, startTime: null };
   }
 }
