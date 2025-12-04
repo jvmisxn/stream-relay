@@ -30,6 +30,41 @@ let relayProcesses = new Map();
 let relayActive = false;
 let streamStartTime = null;
 let inputStartTime = null;
+let nvencAvailable = null; // Cache NVENC detection
+
+// Detect if NVENC hardware encoder is available
+async function detectNvenc() {
+  if (nvencAvailable !== null) return nvencAvailable;
+
+  return new Promise((resolve) => {
+    const proc = spawn('ffmpeg', ['-hide_banner', '-encoders'], { stdio: ['pipe', 'pipe', 'pipe'] });
+    let output = '';
+
+    proc.stdout.on('data', (data) => {
+      output += data.toString();
+    });
+
+    proc.on('close', () => {
+      nvencAvailable = output.includes('h264_nvenc');
+      console.log(`NVENC hardware encoder: ${nvencAvailable ? 'available' : 'not available'}`);
+      resolve(nvencAvailable);
+    });
+
+    proc.on('error', () => {
+      nvencAvailable = false;
+      resolve(false);
+    });
+
+    // Timeout after 5 seconds
+    setTimeout(() => {
+      if (nvencAvailable === null) {
+        proc.kill();
+        nvencAvailable = false;
+        resolve(false);
+      }
+    }, 5000);
+  });
+}
 
 // Check RTMP input status by querying nginx stat page
 async function checkRtmpInput() {
@@ -75,12 +110,15 @@ app.use(authMiddleware);
 // Health check
 app.get('/health', async (req, res) => {
   const input = await checkRtmpInput();
+  const hasNvenc = await detectNvenc();
   res.json({
     status: 'ok',
     uptime: process.uptime(),
     relayActive,
     streamCount: relayProcesses.size,
-    inputAvailable: input.available
+    inputAvailable: input.available,
+    nvencAvailable: hasNvenc,
+    encoder: hasNvenc ? 'nvenc' : 'cpu'
   });
 });
 
@@ -111,35 +149,81 @@ app.get('/relay/status', (req, res) => {
   });
 });
 
+// Map CPU presets to NVENC presets
+const nvencPresetMap = {
+  'ultrafast': 'p1',
+  'superfast': 'p2',
+  'veryfast': 'p3',
+  'faster': 'p4',
+  'fast': 'p5',
+  'medium': 'p5',
+  'slow': 'p6',
+  'slower': 'p7'
+};
+
 // Build FFmpeg args for a platform
-function buildFFmpegArgs(platform, inputUrl) {
+function buildFFmpegArgs(platform, inputUrl, useNvenc = false) {
   const fullRtmpUrl = platform.rtmpUrl + '/' + platform.streamKey;
 
   // Base args
   const args = [
     '-hide_banner',
-    '-loglevel', 'warning',
-    '-i', inputUrl
+    '-loglevel', 'warning'
   ];
+
+  // Add hardware acceleration input if using NVENC
+  if (useNvenc) {
+    args.push('-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda');
+  }
+
+  args.push('-i', inputUrl);
 
   // Check if platform has custom encoding settings
   if (platform.encoding && !platform.encoding.usePassthrough) {
-    // Re-encode with custom settings
-    args.push(
-      '-c:v', 'libx264',
-      '-preset', platform.encoding.preset || 'veryfast',
-      '-b:v', (platform.encoding.bitrate || 4500) + 'k',
-      '-maxrate', (platform.encoding.maxBitrate || platform.encoding.bitrate || 4500) + 'k',
-      '-bufsize', ((platform.encoding.bitrate || 4500) * 2) + 'k',
-      '-g', String(platform.encoding.keyframeInterval || 60),
-      '-c:a', 'aac',
-      '-b:a', (platform.encoding.audioBitrate || 160) + 'k',
-      '-ar', '44100'
-    );
+    const bitrate = platform.encoding.bitrate || 4500;
+    const maxBitrate = platform.encoding.maxBitrate || bitrate;
+    const audioBitrate = platform.encoding.audioBitrate || 160;
+    const cpuPreset = platform.encoding.preset || 'veryfast';
 
-    // Resolution scaling if specified
-    if (platform.encoding.resolution) {
-      args.push('-vf', `scale=${platform.encoding.resolution}`);
+    if (useNvenc) {
+      // Use NVENC hardware encoder
+      const nvencPreset = nvencPresetMap[cpuPreset] || 'p4';
+      args.push(
+        '-c:v', 'h264_nvenc',
+        '-preset', nvencPreset,
+        '-rc', 'cbr',
+        '-b:v', bitrate + 'k',
+        '-maxrate', maxBitrate + 'k',
+        '-bufsize', (bitrate * 2) + 'k',
+        '-g', String(platform.encoding.keyframeInterval || 60),
+        '-profile:v', 'high',
+        '-c:a', 'aac',
+        '-b:a', audioBitrate + 'k',
+        '-ar', '44100'
+      );
+
+      // Resolution scaling with CUDA
+      if (platform.encoding.resolution) {
+        args.push('-vf', `scale_cuda=${platform.encoding.resolution}`);
+      }
+    } else {
+      // Use CPU encoder (libx264)
+      args.push(
+        '-c:v', 'libx264',
+        '-preset', cpuPreset,
+        '-b:v', bitrate + 'k',
+        '-maxrate', maxBitrate + 'k',
+        '-bufsize', (bitrate * 2) + 'k',
+        '-g', String(platform.encoding.keyframeInterval || 60),
+        '-c:a', 'aac',
+        '-b:a', audioBitrate + 'k',
+        '-ar', '44100'
+      );
+
+      // Resolution scaling with CPU
+      if (platform.encoding.resolution) {
+        args.push('-vf', `scale=${platform.encoding.resolution}`);
+      }
     }
   } else {
     // Passthrough - copy streams without re-encoding
@@ -156,6 +240,10 @@ function buildFFmpegArgs(platform, inputUrl) {
 app.post('/relay/start', async (req, res) => {
   try {
     console.log('Starting relay...');
+
+    // Detect NVENC availability
+    const useNvenc = await detectNvenc();
+    console.log(`Using encoder: ${useNvenc ? 'NVENC (GPU)' : 'libx264 (CPU)'}`);
 
     // Fetch enabled platforms from dashboard
     const platformsRes = await fetch(DASHBOARD_URL + '/api/vm/platforms', {
@@ -183,7 +271,7 @@ app.post('/relay/start', async (req, res) => {
 
     // Start FFmpeg relay for each platform
     for (const platform of platforms) {
-      const ffmpegArgs = buildFFmpegArgs(platform, inputUrl);
+      const ffmpegArgs = buildFFmpegArgs(platform, inputUrl, useNvenc);
 
       console.log(`Starting relay to ${platform.name}:`, ffmpegArgs.join(' ').substring(0, 100) + '...');
 
