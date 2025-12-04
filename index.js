@@ -29,6 +29,35 @@ if (!API_SECRET || !DASHBOARD_URL) {
 let relayProcesses = new Map();
 let relayActive = false;
 let streamStartTime = null;
+let inputStartTime = null;
+
+// Check RTMP input status by querying nginx stat page
+async function checkRtmpInput() {
+  try {
+    const res = await fetch('http://127.0.0.1/stat');
+    if (!res.ok) return { available: false, startTime: null };
+
+    const xml = await res.text();
+    // Check if there's an active stream in the "live" application
+    // The nginx-rtmp stat page shows <stream><name>stream</name>...</stream> when active
+    const hasStream = xml.includes('<application><name>live</name>') &&
+                      xml.includes('<stream>') &&
+                      xml.includes('<name>stream</name>');
+
+    if (hasStream && !inputStartTime) {
+      inputStartTime = Date.now();
+    } else if (!hasStream) {
+      inputStartTime = null;
+    }
+
+    return {
+      available: hasStream,
+      startTime: inputStartTime
+    };
+  } catch (error) {
+    return { available: false, startTime: null };
+  }
+}
 
 // Auth middleware
 function authMiddleware(req, res, next) {
@@ -42,13 +71,21 @@ function authMiddleware(req, res, next) {
 app.use(authMiddleware);
 
 // Health check
-app.get('/health', (req, res) => {
+app.get('/health', async (req, res) => {
+  const input = await checkRtmpInput();
   res.json({
     status: 'ok',
     uptime: process.uptime(),
     relayActive,
-    streamCount: relayProcesses.size
+    streamCount: relayProcesses.size,
+    inputAvailable: input.available
   });
+});
+
+// Get RTMP input status
+app.get('/input/status', async (req, res) => {
+  const input = await checkRtmpInput();
+  res.json(input);
 });
 
 // Get relay status
@@ -239,13 +276,14 @@ app.post('/relay/refresh', async (req, res) => {
 });
 
 // Status endpoint (OBS-style status for compatibility)
-app.get('/status', (req, res) => {
+app.get('/status', async (req, res) => {
+  const input = await checkRtmpInput();
   res.json({
     mode: relayActive ? 'live' : 'idle',
     obsConnected: false,
     isStreaming: relayActive,
     streamStartTime: streamStartTime?.toISOString() || null,
-    liveInput: { available: true },
+    liveInput: input,
     platforms: relayProcesses.size
   });
 });
