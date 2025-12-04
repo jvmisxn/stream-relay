@@ -8,6 +8,54 @@ try {
 const express = require('express');
 const cors = require('cors');
 const { spawn } = require('child_process');
+const os = require('os');
+
+// CPU usage tracking
+let lastCpuTimes = os.cpus().map(cpu => cpu.times);
+
+function getCpuUsage() {
+  const cpus = os.cpus();
+  const currentTimes = cpus.map(cpu => cpu.times);
+
+  let totalIdle = 0;
+  let totalTick = 0;
+
+  for (let i = 0; i < cpus.length; i++) {
+    const lastTimes = lastCpuTimes[i];
+    const currTimes = currentTimes[i];
+
+    const idleDiff = currTimes.idle - lastTimes.idle;
+    const totalDiff = (currTimes.user - lastTimes.user) +
+                      (currTimes.nice - lastTimes.nice) +
+                      (currTimes.sys - lastTimes.sys) +
+                      (currTimes.irq - lastTimes.irq) +
+                      idleDiff;
+
+    totalIdle += idleDiff;
+    totalTick += totalDiff;
+  }
+
+  lastCpuTimes = currentTimes;
+
+  const cpuUsage = totalTick > 0 ? Math.round((1 - totalIdle / totalTick) * 100) : 0;
+  return cpuUsage;
+}
+
+function getSystemStats() {
+  const totalMem = os.totalmem();
+  const freeMem = os.freemem();
+  const usedMem = totalMem - freeMem;
+
+  return {
+    cpuUsage: getCpuUsage(),
+    cpuCount: os.cpus().length,
+    memoryUsage: Math.round((usedMem / totalMem) * 100),
+    memoryTotal: Math.round(totalMem / 1024 / 1024), // MB
+    memoryUsed: Math.round(usedMem / 1024 / 1024), // MB
+    memoryFree: Math.round(freeMem / 1024 / 1024), // MB
+    loadAvg: os.loadavg(),
+  };
+}
 
 const app = express();
 
@@ -19,6 +67,8 @@ const API_SECRET = process.env.API_SECRET;
 const DASHBOARD_URL = process.env.DASHBOARD_URL;
 const RTMP_PORT = process.env.RTMP_PORT || 1935;
 const PORT = process.env.PORT || 3001;
+// For Docker: use container hostname. For standalone: use localhost
+const NGINX_HOST = process.env.NGINX_HOST || 'nginx-rtmp';
 
 if (!API_SECRET || !DASHBOARD_URL) {
   console.error('Missing required environment variables: API_SECRET and DASHBOARD_URL');
@@ -82,7 +132,7 @@ async function detectNvenc() {
 // Check RTMP input status by querying nginx stat page
 async function checkRtmpInput() {
   try {
-    const res = await fetch('http://127.0.0.1/stat');
+    const res = await fetch(`http://${NGINX_HOST}/stat`);
     if (!res.ok) return { available: false, startTime: null };
 
     const xml = await res.text();
@@ -124,6 +174,7 @@ app.use(authMiddleware);
 app.get('/health', async (req, res) => {
   const input = await checkRtmpInput();
   const hasNvenc = await detectNvenc();
+  const systemStats = getSystemStats();
   res.json({
     status: 'ok',
     uptime: process.uptime(),
@@ -131,7 +182,8 @@ app.get('/health', async (req, res) => {
     streamCount: relayProcesses.size,
     inputAvailable: input.available,
     nvencAvailable: hasNvenc,
-    encoder: hasNvenc ? 'nvenc' : 'cpu'
+    encoder: hasNvenc ? 'nvenc' : 'cpu',
+    system: systemStats,
   });
 });
 
@@ -195,8 +247,16 @@ function buildFFmpegArgs(platform, inputUrl, useNvenc = false) {
   if (platform.encoding && !platform.encoding.usePassthrough) {
     const bitrate = platform.encoding.bitrate || 4500;
     const maxBitrate = platform.encoding.maxBitrate || bitrate;
+    const bufsize = platform.encoding.bufsize || bitrate; // VBV buffer size
     const audioBitrate = platform.encoding.audioBitrate || 160;
     const cpuPreset = platform.encoding.preset || 'veryfast';
+    const framerate = platform.encoding.framerate || 60;
+    const useCbr = platform.encoding.cbr !== false; // Default to CBR for streaming
+    const rcLookahead = platform.encoding.rcLookahead || framerate; // Default to 1 second
+    // keyframeInterval is in seconds, -g expects frames
+    const keyframeIntervalSec = platform.encoding.keyframeInterval || 2;
+    const gopSize = keyframeIntervalSec * framerate; // e.g., 2 sec * 60 fps = 120 frames
+    const profile = platform.encoding.profile || 'high';
 
     if (useNvenc) {
       // Use NVENC hardware encoder
@@ -204,15 +264,18 @@ function buildFFmpegArgs(platform, inputUrl, useNvenc = false) {
       args.push(
         '-c:v', 'h264_nvenc',
         '-preset', nvencPreset,
-        '-rc', 'cbr',
+        '-tune', 'll',           // Low-latency tuning for streaming
+        '-rc', 'cbr',            // NVENC CBR mode
         '-b:v', bitrate + 'k',
         '-maxrate', maxBitrate + 'k',
-        '-bufsize', (bitrate * 2) + 'k',
-        '-g', String(platform.encoding.keyframeInterval || 60),
-        '-profile:v', 'high',
+        '-bufsize', bufsize + 'k',
+        '-g', String(gopSize),
+        '-keyint_min', String(gopSize), // Force consistent keyframe interval
+        '-profile:v', profile,
+        '-rc-lookahead', String(Math.min(rcLookahead, 32)), // NVENC max is 32
         '-c:a', 'aac',
         '-b:a', audioBitrate + 'k',
-        '-ar', '44100'
+        '-ar', '48000'           // 48kHz is standard for streaming
       );
 
       // Resolution scaling with CUDA
@@ -224,13 +287,30 @@ function buildFFmpegArgs(platform, inputUrl, useNvenc = false) {
       args.push(
         '-c:v', 'libx264',
         '-preset', cpuPreset,
+        '-tune', 'zerolatency',  // Low-latency tuning for streaming
         '-b:v', bitrate + 'k',
         '-maxrate', maxBitrate + 'k',
-        '-bufsize', (bitrate * 2) + 'k',
-        '-g', String(platform.encoding.keyframeInterval || 60),
+        '-bufsize', bufsize + 'k',
+        '-g', String(gopSize),
+        '-keyint_min', String(gopSize), // Force consistent keyframe interval
+        '-profile:v', profile
+      );
+
+      // Add CBR-specific x264 options for stable bitrate
+      if (useCbr) {
+        args.push('-x264-params', `nal-hrd=cbr:force-cfr=1`);
+      }
+
+      // Add rate control lookahead for better quality (if not using zerolatency)
+      // Note: zerolatency disables some lookahead, but rc-lookahead still helps
+      if (rcLookahead > 0) {
+        args.push('-rc-lookahead', String(rcLookahead));
+      }
+
+      args.push(
         '-c:a', 'aac',
         '-b:a', audioBitrate + 'k',
-        '-ar', '44100'
+        '-ar', '48000'           // 48kHz is standard for streaming
       );
 
       // Resolution scaling with CPU
@@ -280,7 +360,7 @@ app.post('/relay/start', async (req, res) => {
     // Stop any existing relays
     stopAllRelays();
 
-    const inputUrl = `rtmp://localhost:${RTMP_PORT}/live/stream`;
+    const inputUrl = `rtmp://${NGINX_HOST}:${RTMP_PORT}/live/stream`;
 
     // Start FFmpeg relay for each platform
     for (const platform of platforms) {
@@ -407,5 +487,6 @@ process.on('SIGINT', () => {
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Stream Manager listening on port ${PORT}`);
   console.log(`Dashboard URL: ${DASHBOARD_URL}`);
-  console.log(`RTMP Input: rtmp://localhost:${RTMP_PORT}/live/stream`);
+  console.log(`RTMP Input: rtmp://${NGINX_HOST}:${RTMP_PORT}/live/stream`);
+  console.log(`Nginx Stats: http://${NGINX_HOST}/stat`);
 });
