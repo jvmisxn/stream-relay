@@ -32,21 +32,34 @@ let streamStartTime = null;
 let inputStartTime = null;
 let nvencAvailable = null; // Cache NVENC detection
 
-// Detect if NVENC hardware encoder is available
+// Detect if NVENC hardware encoder is available by actually testing it
 async function detectNvenc() {
   if (nvencAvailable !== null) return nvencAvailable;
 
   return new Promise((resolve) => {
-    const proc = spawn('ffmpeg', ['-hide_banner', '-encoders'], { stdio: ['pipe', 'pipe', 'pipe'] });
-    let output = '';
+    // Try to initialize NVENC with a simple test - this will fail if no GPU
+    const proc = spawn('ffmpeg', [
+      '-hide_banner',
+      '-f', 'lavfi',
+      '-i', 'nullsrc=s=256x256:d=0.1',
+      '-c:v', 'h264_nvenc',
+      '-f', 'null',
+      '-'
+    ], { stdio: ['pipe', 'pipe', 'pipe'] });
 
-    proc.stdout.on('data', (data) => {
-      output += data.toString();
+    let stderr = '';
+
+    proc.stderr.on('data', (data) => {
+      stderr += data.toString();
     });
 
-    proc.on('close', () => {
-      nvencAvailable = output.includes('h264_nvenc');
-      console.log(`NVENC hardware encoder: ${nvencAvailable ? 'available' : 'not available'}`);
+    proc.on('close', (code) => {
+      // NVENC works if exit code is 0 and no "Cannot load" or "No NVENC capable" errors
+      const hasError = stderr.includes('Cannot load') ||
+                       stderr.includes('No NVENC capable') ||
+                       stderr.includes('CUDA');
+      nvencAvailable = code === 0 && !hasError;
+      console.log(`NVENC hardware encoder: ${nvencAvailable ? 'available' : 'not available (no GPU)'}`);
       resolve(nvencAvailable);
     });
 
@@ -55,14 +68,14 @@ async function detectNvenc() {
       resolve(false);
     });
 
-    // Timeout after 5 seconds
+    // Timeout after 10 seconds
     setTimeout(() => {
       if (nvencAvailable === null) {
         proc.kill();
         nvencAvailable = false;
         resolve(false);
       }
-    }, 5000);
+    }, 10000);
   });
 }
 
