@@ -82,6 +82,85 @@ let streamStartTime = null;
 let inputStartTime = null;
 let nvencAvailable = null; // Cache NVENC detection
 
+// Stats tracking - stores bitrate history for each platform
+// Structure: { platformId: { history: [{timestamp, bitrate, fps, speed}], current: {...} } }
+let platformStats = new Map();
+const MAX_STATS_HISTORY = 3600; // Keep 1 hour of per-second stats
+
+// Parse FFmpeg progress output to extract stats
+function parseFFmpegOutput(line) {
+  const stats = {};
+
+  // FFmpeg outputs progress like: frame= 1234 fps= 60 q=28.0 size=   12345kB time=00:00:41.23 bitrate=2468.5kbits/s speed=1.00x
+  const bitrateMatch = line.match(/bitrate=\s*([\d.]+)kbits\/s/);
+  if (bitrateMatch) {
+    stats.bitrate = parseFloat(bitrateMatch[1]);
+  }
+
+  const fpsMatch = line.match(/fps=\s*([\d.]+)/);
+  if (fpsMatch) {
+    stats.fps = parseFloat(fpsMatch[1]);
+  }
+
+  const speedMatch = line.match(/speed=\s*([\d.]+)x/);
+  if (speedMatch) {
+    stats.speed = parseFloat(speedMatch[1]);
+  }
+
+  const frameMatch = line.match(/frame=\s*(\d+)/);
+  if (frameMatch) {
+    stats.frame = parseInt(frameMatch[1]);
+  }
+
+  const timeMatch = line.match(/time=(\d+):(\d+):([\d.]+)/);
+  if (timeMatch) {
+    const hours = parseInt(timeMatch[1]);
+    const minutes = parseInt(timeMatch[2]);
+    const seconds = parseFloat(timeMatch[3]);
+    stats.time = hours * 3600 + minutes * 60 + seconds;
+  }
+
+  return Object.keys(stats).length > 0 ? stats : null;
+}
+
+// Update stats for a platform
+function updatePlatformStats(platformId, stats) {
+  if (!platformStats.has(platformId)) {
+    platformStats.set(platformId, { history: [], current: null });
+  }
+
+  const platformData = platformStats.get(platformId);
+  const now = Date.now();
+
+  // Update current stats
+  platformData.current = { ...stats, timestamp: now };
+
+  // Add to history (only if we have bitrate data)
+  if (stats.bitrate !== undefined) {
+    platformData.history.push({
+      timestamp: now,
+      bitrate: stats.bitrate,
+      fps: stats.fps,
+      speed: stats.speed
+    });
+
+    // Trim history to max size
+    if (platformData.history.length > MAX_STATS_HISTORY) {
+      platformData.history = platformData.history.slice(-MAX_STATS_HISTORY);
+    }
+  }
+}
+
+// Clear stats for a platform
+function clearPlatformStats(platformId) {
+  platformStats.delete(platformId);
+}
+
+// Clear all stats
+function clearAllStats() {
+  platformStats.clear();
+}
+
 // Detect if NVENC hardware encoder is available by actually testing it
 async function detectNvenc() {
   if (nvencAvailable !== null) return nvencAvailable;
@@ -197,12 +276,14 @@ app.get('/input/status', async (req, res) => {
 app.get('/relay/status', (req, res) => {
   const streams = [];
   relayProcesses.forEach((proc, id) => {
+    const stats = platformStats.get(id);
     streams.push({
       id,
       platform: proc.platform,
       rtmpUrl: proc.rtmpUrl,
       pid: proc.process?.pid,
-      running: proc.process && !proc.process.killed
+      running: proc.process && !proc.process.killed,
+      currentStats: stats?.current || null
     });
   });
 
@@ -212,6 +293,78 @@ app.get('/relay/status', (req, res) => {
     count: streams.length,
     startTime: streamStartTime
   });
+});
+
+// Get streaming stats for all platforms
+app.get('/relay/stats', (req, res) => {
+  const { since, limit } = req.query;
+  const sinceTime = since ? parseInt(since) : 0;
+  const maxPoints = limit ? parseInt(limit) : 300; // Default 5 minutes at 1/sec
+
+  const stats = {};
+  platformStats.forEach((data, platformId) => {
+    // Filter history by time and limit points
+    let history = data.history;
+    if (sinceTime > 0) {
+      history = history.filter(h => h.timestamp > sinceTime);
+    }
+    // Take last N points
+    if (history.length > maxPoints) {
+      history = history.slice(-maxPoints);
+    }
+
+    stats[platformId] = {
+      platformName: data.platformName,
+      current: data.current,
+      history: history,
+      ended: data.ended || false,
+      endTime: data.endTime || null
+    };
+  });
+
+  res.json({
+    stats,
+    streamStartTime,
+    serverTime: Date.now()
+  });
+});
+
+// Get stats for a single platform
+app.get('/relay/stats/:platformId', (req, res) => {
+  const { platformId } = req.params;
+  const { since, limit } = req.query;
+  const sinceTime = since ? parseInt(since) : 0;
+  const maxPoints = limit ? parseInt(limit) : 300;
+
+  const data = platformStats.get(platformId);
+  if (!data) {
+    return res.status(404).json({ error: 'Platform not found or no stats available' });
+  }
+
+  let history = data.history;
+  if (sinceTime > 0) {
+    history = history.filter(h => h.timestamp > sinceTime);
+  }
+  if (history.length > maxPoints) {
+    history = history.slice(-maxPoints);
+  }
+
+  res.json({
+    platformId,
+    platformName: data.platformName,
+    current: data.current,
+    history: history,
+    ended: data.ended || false,
+    endTime: data.endTime || null,
+    streamStartTime,
+    serverTime: Date.now()
+  });
+});
+
+// Clear stats (for starting fresh)
+app.post('/relay/stats/clear', (req, res) => {
+  clearAllStats();
+  res.json({ success: true, message: 'Stats cleared' });
 });
 
 // Map CPU presets to NVENC presets
@@ -230,10 +383,11 @@ const nvencPresetMap = {
 function buildFFmpegArgs(platform, inputUrl, useNvenc = false) {
   const fullRtmpUrl = platform.rtmpUrl + '/' + platform.streamKey;
 
-  // Base args
+  // Base args - use 'info' level to get progress stats
   const args = [
     '-hide_banner',
-    '-loglevel', 'warning'
+    '-loglevel', 'info',
+    '-stats'              // Enable progress stats output
   ];
 
   // Add hardware acceleration input if using NVENC
@@ -287,24 +441,20 @@ function buildFFmpegArgs(platform, inputUrl, useNvenc = false) {
       args.push(
         '-c:v', 'libx264',
         '-preset', cpuPreset,
-        '-tune', 'zerolatency',  // Low-latency tuning for streaming
         '-b:v', bitrate + 'k',
         '-maxrate', maxBitrate + 'k',
         '-bufsize', bufsize + 'k',
         '-g', String(gopSize),
         '-keyint_min', String(gopSize), // Force consistent keyframe interval
-        '-profile:v', profile
+        '-profile:v', profile,
+        '-bf', '2'              // Use 2 B-frames (good for quality, Twitch compatible)
       );
 
       // Add CBR-specific x264 options for stable bitrate
       if (useCbr) {
-        args.push('-x264-params', `nal-hrd=cbr:force-cfr=1`);
-      }
-
-      // Add rate control lookahead for better quality (if not using zerolatency)
-      // Note: zerolatency disables some lookahead, but rc-lookahead still helps
-      if (rcLookahead > 0) {
-        args.push('-rc-lookahead', String(rcLookahead));
+        args.push('-x264-params', `nal-hrd=cbr:force-cfr=1:rc-lookahead=${Math.min(rcLookahead, 60)}`);
+      } else if (rcLookahead > 0) {
+        args.push('-x264-params', `rc-lookahead=${Math.min(rcLookahead, 60)}`);
       }
 
       args.push(
@@ -370,10 +520,21 @@ app.post('/relay/start', async (req, res) => {
 
       const proc = spawn('ffmpeg', ffmpegArgs);
 
+      // Initialize stats for this platform
+      platformStats.set(platform.id, { history: [], current: null, platformName: platform.name });
+
       proc.stderr.on('data', (data) => {
         const msg = data.toString().trim();
         if (msg) {
-          console.log(`[${platform.name}] ${msg.slice(0, 200)}`);
+          // Parse FFmpeg progress output for stats
+          const stats = parseFFmpegOutput(msg);
+          if (stats) {
+            updatePlatformStats(platform.id, stats);
+          }
+          // Only log non-progress messages (errors, warnings)
+          if (!msg.includes('frame=') && !msg.includes('bitrate=')) {
+            console.log(`[${platform.name}] ${msg.slice(0, 200)}`);
+          }
         }
       });
 
@@ -384,6 +545,12 @@ app.post('/relay/start', async (req, res) => {
       proc.on('close', (code) => {
         console.log(`[${platform.name}] FFmpeg exited with code ${code}`);
         relayProcesses.delete(platform.id);
+        // Keep stats for viewing after stream ends, but mark as ended
+        const stats = platformStats.get(platform.id);
+        if (stats) {
+          stats.ended = true;
+          stats.endTime = Date.now();
+        }
 
         // If all processes exited, mark relay as inactive
         if (relayProcesses.size === 0) {
@@ -433,6 +600,187 @@ app.post('/relay/stop', (req, res) => {
   console.log('Stopping relay...');
   stopAllRelays();
   res.json({ success: true, message: 'Relay stopped' });
+});
+
+// Stop a single platform stream (by platform ID)
+app.post('/relay/stop/:platformId', (req, res) => {
+  const { platformId } = req.params;
+  const proc = relayProcesses.get(platformId);
+
+  if (!proc) {
+    return res.status(404).json({ error: 'Platform stream not found', platformId });
+  }
+
+  console.log(`Stopping relay to ${proc.platform}...`);
+  if (proc.process && !proc.process.killed) {
+    proc.process.kill('SIGTERM');
+  }
+  relayProcesses.delete(platformId);
+
+  // Update relay status
+  if (relayProcesses.size === 0) {
+    relayActive = false;
+    streamStartTime = null;
+  }
+
+  res.json({ success: true, message: `Stopped relay to ${proc.platform}`, platformId });
+});
+
+// Start a single platform stream (by platform ID)
+app.post('/relay/start/:platformId', async (req, res) => {
+  const { platformId } = req.params;
+
+  try {
+    // Check if already running
+    if (relayProcesses.has(platformId)) {
+      return res.status(400).json({ error: 'Platform stream already running', platformId });
+    }
+
+    // Detect NVENC availability
+    const useNvenc = await detectNvenc();
+
+    // Fetch platform config from dashboard
+    const platformsRes = await fetch(DASHBOARD_URL + '/api/vm/platforms', {
+      headers: { 'Authorization': 'Bearer ' + API_SECRET }
+    });
+
+    if (!platformsRes.ok) {
+      return res.status(500).json({ error: 'Failed to fetch platforms from dashboard' });
+    }
+
+    const { platforms } = await platformsRes.json();
+    const platform = platforms.find(p => p.id === platformId);
+
+    if (!platform) {
+      return res.status(404).json({ error: 'Platform not found or not enabled', platformId });
+    }
+
+    const inputUrl = `rtmp://${NGINX_HOST}:${RTMP_PORT}/live/stream`;
+    const ffmpegArgs = buildFFmpegArgs(platform, inputUrl, useNvenc);
+
+    console.log(`Starting relay to ${platform.name}:`, ffmpegArgs.join(' ').substring(0, 100) + '...');
+
+    const proc = spawn('ffmpeg', ffmpegArgs);
+
+    proc.stderr.on('data', (data) => {
+      const msg = data.toString().trim();
+      if (msg) {
+        console.log(`[${platform.name}] ${msg.slice(0, 200)}`);
+      }
+    });
+
+    proc.on('error', (err) => {
+      console.error(`[${platform.name}] FFmpeg error:`, err.message);
+    });
+
+    proc.on('close', (code) => {
+      console.log(`[${platform.name}] FFmpeg exited with code ${code}`);
+      relayProcesses.delete(platform.id);
+
+      if (relayProcesses.size === 0) {
+        relayActive = false;
+        streamStartTime = null;
+      }
+    });
+
+    relayProcesses.set(platform.id, {
+      process: proc,
+      platform: platform.name,
+      rtmpUrl: platform.rtmpUrl,
+      startTime: new Date()
+    });
+
+    relayActive = true;
+    if (!streamStartTime) {
+      streamStartTime = new Date();
+    }
+
+    res.json({ success: true, message: `Started relay to ${platform.name}`, platformId });
+  } catch (error) {
+    console.error('Failed to start platform relay:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Restart a single platform stream (stop then start)
+app.post('/relay/restart/:platformId', async (req, res) => {
+  const { platformId } = req.params;
+
+  try {
+    // Stop if running
+    const proc = relayProcesses.get(platformId);
+    if (proc && proc.process && !proc.process.killed) {
+      console.log(`Stopping relay to ${proc.platform} for restart...`);
+      proc.process.kill('SIGTERM');
+      relayProcesses.delete(platformId);
+      // Brief delay to let process die
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+
+    // Detect NVENC availability
+    const useNvenc = await detectNvenc();
+
+    // Fetch platform config from dashboard
+    const platformsRes = await fetch(DASHBOARD_URL + '/api/vm/platforms', {
+      headers: { 'Authorization': 'Bearer ' + API_SECRET }
+    });
+
+    if (!platformsRes.ok) {
+      return res.status(500).json({ error: 'Failed to fetch platforms from dashboard' });
+    }
+
+    const { platforms } = await platformsRes.json();
+    const platform = platforms.find(p => p.id === platformId);
+
+    if (!platform) {
+      return res.status(404).json({ error: 'Platform not found or not enabled', platformId });
+    }
+
+    const inputUrl = `rtmp://${NGINX_HOST}:${RTMP_PORT}/live/stream`;
+    const ffmpegArgs = buildFFmpegArgs(platform, inputUrl, useNvenc);
+
+    console.log(`Restarting relay to ${platform.name}:`, ffmpegArgs.join(' ').substring(0, 100) + '...');
+
+    const newProc = spawn('ffmpeg', ffmpegArgs);
+
+    newProc.stderr.on('data', (data) => {
+      const msg = data.toString().trim();
+      if (msg) {
+        console.log(`[${platform.name}] ${msg.slice(0, 200)}`);
+      }
+    });
+
+    newProc.on('error', (err) => {
+      console.error(`[${platform.name}] FFmpeg error:`, err.message);
+    });
+
+    newProc.on('close', (code) => {
+      console.log(`[${platform.name}] FFmpeg exited with code ${code}`);
+      relayProcesses.delete(platform.id);
+
+      if (relayProcesses.size === 0) {
+        relayActive = false;
+        streamStartTime = null;
+      }
+    });
+
+    relayProcesses.set(platform.id, {
+      process: newProc,
+      platform: platform.name,
+      rtmpUrl: platform.rtmpUrl,
+      startTime: new Date()
+    });
+
+    relayActive = true;
+    if (!streamStartTime) {
+      streamStartTime = new Date();
+    }
+
+    res.json({ success: true, message: `Restarted relay to ${platform.name}`, platformId });
+  } catch (error) {
+    console.error('Failed to restart platform relay:', error);
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // Refresh relay (re-fetch platforms and restart)
