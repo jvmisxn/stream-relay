@@ -586,14 +586,10 @@ app.post('/relay/start', async (req, res) => {
 
     // Detect input protocol and build appropriate input URL
     const inputStatus = await checkInputStatus();
-    let inputUrl;
-    if (inputStatus.protocol === 'srt') {
-      inputUrl = `srt://${NGINX_HOST}:${SRT_PORT}?streamid=read:live/stream&mode=caller`;
-      console.log('Using SRT input');
-    } else {
-      inputUrl = `rtmp://${NGINX_HOST}:${RTMP_PORT}/live/stream`;
-      console.log('Using RTMP input');
-    }
+    // Always use RTMP for internal reading - more stable for multiple readers
+    // MediaMTX converts SRT input to RTMP automatically
+    const inputUrl = `rtmp://${NGINX_HOST}:${RTMP_PORT}/live/stream`;
+    console.log(`Input detected via ${inputStatus.protocol || 'rtmp'}, reading via RTMP for stability`);
 
     // Start FFmpeg relay for each platform
     for (const platform of platforms) {
@@ -740,12 +736,8 @@ app.post('/relay/start/:platformId', async (req, res) => {
 
     // Detect input protocol and build appropriate input URL
     const inputStatus = await checkInputStatus();
-    let inputUrl;
-    if (inputStatus.protocol === 'srt') {
-      inputUrl = `srt://${NGINX_HOST}:${SRT_PORT}?streamid=read:live/stream&mode=caller`;
-    } else {
-      inputUrl = `rtmp://${NGINX_HOST}:${RTMP_PORT}/live/stream`;
-    }
+    // Always use RTMP for internal reading - more stable for multiple readers
+    const inputUrl = `rtmp://${NGINX_HOST}:${RTMP_PORT}/live/stream`;
 
     const ffmpegArgs = buildFFmpegArgs(platform, inputUrl, useNvenc);
 
@@ -829,12 +821,8 @@ app.post('/relay/restart/:platformId', async (req, res) => {
 
     // Detect input protocol and build appropriate input URL
     const inputStatus = await checkInputStatus();
-    let inputUrl;
-    if (inputStatus.protocol === 'srt') {
-      inputUrl = `srt://${NGINX_HOST}:${SRT_PORT}?streamid=read:live/stream&mode=caller`;
-    } else {
-      inputUrl = `rtmp://${NGINX_HOST}:${RTMP_PORT}/live/stream`;
-    }
+    // Always use RTMP for internal reading - more stable for multiple readers
+    const inputUrl = `rtmp://${NGINX_HOST}:${RTMP_PORT}/live/stream`;
 
     const ffmpegArgs = buildFFmpegArgs(platform, inputUrl, useNvenc);
 
