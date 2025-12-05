@@ -66,9 +66,12 @@ app.use(express.json());
 const API_SECRET = process.env.API_SECRET;
 const DASHBOARD_URL = process.env.DASHBOARD_URL;
 const RTMP_PORT = process.env.RTMP_PORT || 1935;
+const SRT_PORT = process.env.SRT_PORT || 8890;
 const PORT = process.env.PORT || 3001;
 // For Docker: use container hostname. For standalone: use localhost
-const NGINX_HOST = process.env.NGINX_HOST || 'nginx-rtmp';
+const NGINX_HOST = process.env.NGINX_HOST || 'mediamtx';
+// MediaMTX API for input status checks
+const MEDIAMTX_API = process.env.MEDIAMTX_API || 'http://mediamtx:9997';
 
 if (!API_SECRET || !DASHBOARD_URL) {
   console.error('Missing required environment variables: API_SECRET and DASHBOARD_URL');
@@ -208,34 +211,52 @@ async function detectNvenc() {
   });
 }
 
-// Check RTMP input status by querying nginx stat page
-async function checkRtmpInput() {
+// Check input status via MediaMTX API (supports both RTMP and SRT)
+async function checkInputStatus() {
   try {
-    const res = await fetch(`http://${NGINX_HOST}/stat`);
-    if (!res.ok) return { available: false, startTime: null };
+    // Use paths/list endpoint and find our stream
+    const res = await fetch(`${MEDIAMTX_API}/v3/paths/list`);
+    if (!res.ok) {
+      if (inputStartTime) inputStartTime = null;
+      return { available: false, protocol: null, startTime: null };
+    }
 
-    const xml = await res.text();
-    // Check if there's an active stream in the "live" application
-    // Look for a publishing stream (has <publishing/> tag inside <stream>)
-    // The XML structure is: <application><name>live</name><live><stream>...<publishing/>...</stream></live></application>
-    const hasLiveApp = xml.includes('<name>live</name>');
-    const hasPublishingStream = xml.includes('<publishing/>') && xml.includes('<stream>');
-    const hasStream = hasLiveApp && hasPublishingStream;
+    const data = await res.json();
 
-    if (hasStream && !inputStartTime) {
+    // Find the live/stream path in the items
+    const streamPath = data.items?.find(item => item.name === 'live/stream');
+
+    if (!streamPath || !streamPath.ready) {
+      if (inputStartTime) inputStartTime = null;
+      return { available: false, protocol: null, startTime: null };
+    }
+
+    // Detect protocol from source type
+    let protocol = null;
+    if (streamPath.source?.type === 'srtConn') {
+      protocol = 'srt';
+    } else if (streamPath.source?.type === 'rtmpConn') {
+      protocol = 'rtmp';
+    }
+
+    if (!inputStartTime) {
       inputStartTime = Date.now();
-    } else if (!hasStream) {
-      inputStartTime = null;
     }
 
     return {
-      available: hasStream,
+      available: true,
+      protocol,
       startTime: inputStartTime
     };
   } catch (error) {
-    console.error('Failed to check RTMP input:', error.message);
-    return { available: false, startTime: null };
+    console.error('Failed to check input status:', error.message);
+    return { available: false, protocol: null, startTime: null };
   }
+}
+
+// Backwards compatibility alias
+async function checkRtmpInput() {
+  return checkInputStatus();
 }
 
 // Auth middleware
@@ -251,7 +272,7 @@ app.use(authMiddleware);
 
 // Health check
 app.get('/health', async (req, res) => {
-  const input = await checkRtmpInput();
+  const input = await checkInputStatus();
   const hasNvenc = await detectNvenc();
   const systemStats = getSystemStats();
   res.json({
@@ -259,6 +280,12 @@ app.get('/health', async (req, res) => {
     uptime: process.uptime(),
     relayActive,
     streamCount: relayProcesses.size,
+    input: {
+      available: input.available,
+      protocol: input.protocol,
+      startTime: input.startTime
+    },
+    // Backwards compatibility
     inputAvailable: input.available,
     nvencAvailable: hasNvenc,
     encoder: hasNvenc ? 'nvenc' : 'cpu',
@@ -266,9 +293,9 @@ app.get('/health', async (req, res) => {
   });
 });
 
-// Get RTMP input status
+// Get input status (RTMP or SRT)
 app.get('/input/status', async (req, res) => {
-  const input = await checkRtmpInput();
+  const input = await checkInputStatus();
   res.json(input);
 });
 
@@ -277,10 +304,13 @@ app.get('/relay/status', (req, res) => {
   const streams = [];
   relayProcesses.forEach((proc, id) => {
     const stats = platformStats.get(id);
+    // Detect output protocol from URL
+    const protocol = proc.rtmpUrl?.startsWith('srt://') ? 'srt' : 'rtmp';
     streams.push({
       id,
       platform: proc.platform,
       rtmpUrl: proc.rtmpUrl,
+      protocol,
       pid: proc.process?.pid,
       running: proc.process && !proc.process.killed,
       currentStats: stats?.current || null
@@ -381,7 +411,45 @@ const nvencPresetMap = {
 
 // Build FFmpeg args for a platform
 function buildFFmpegArgs(platform, inputUrl, useNvenc = false) {
-  const fullRtmpUrl = platform.rtmpUrl + '/' + platform.streamKey;
+  // Detect if output is SRT or RTMP
+  const isSrtOutput = platform.rtmpUrl.startsWith('srt://');
+
+  // Build output URL based on protocol
+  let outputUrl;
+  if (isSrtOutput) {
+    // SRT output: build URL with query parameters
+    const srtParams = new URLSearchParams();
+
+    // Stream ID (use stream key as identifier)
+    if (platform.streamKey) {
+      srtParams.set('streamid', platform.streamKey);
+    }
+
+    // SRT-specific settings from platform config
+    if (platform.srtSettings) {
+      if (platform.srtSettings.latency) {
+        // Convert milliseconds to microseconds for SRT
+        srtParams.set('latency', String(platform.srtSettings.latency * 1000));
+      }
+      if (platform.srtSettings.passphrase) {
+        srtParams.set('passphrase', platform.srtSettings.passphrase);
+      }
+      if (platform.srtSettings.mode) {
+        srtParams.set('mode', platform.srtSettings.mode);
+      }
+    } else {
+      // Default SRT settings
+      srtParams.set('latency', '200000'); // 200ms default
+      srtParams.set('mode', 'caller');
+    }
+
+    outputUrl = platform.rtmpUrl + '?' + srtParams.toString();
+  } else {
+    // RTMP output: append stream key to path
+    outputUrl = platform.rtmpUrl + '/' + platform.streamKey;
+  }
+
+  const fullRtmpUrl = isSrtOutput ? outputUrl : platform.rtmpUrl + '/' + platform.streamKey;
 
   // Base args - use 'info' level to get progress stats
   const args = [
@@ -473,8 +541,14 @@ function buildFFmpegArgs(platform, inputUrl, useNvenc = false) {
     args.push('-c', 'copy');
   }
 
-  // Output
-  args.push('-f', 'flv', fullRtmpUrl);
+  // Output format depends on protocol
+  if (isSrtOutput) {
+    // SRT uses MPEG-TS container
+    args.push('-f', 'mpegts', outputUrl);
+  } else {
+    // RTMP uses FLV container
+    args.push('-f', 'flv', fullRtmpUrl);
+  }
 
   return args;
 }
@@ -510,7 +584,16 @@ app.post('/relay/start', async (req, res) => {
     // Stop any existing relays
     stopAllRelays();
 
-    const inputUrl = `rtmp://${NGINX_HOST}:${RTMP_PORT}/live/stream`;
+    // Detect input protocol and build appropriate input URL
+    const inputStatus = await checkInputStatus();
+    let inputUrl;
+    if (inputStatus.protocol === 'srt') {
+      inputUrl = `srt://${NGINX_HOST}:${SRT_PORT}?streamid=read:live/stream&mode=caller`;
+      console.log('Using SRT input');
+    } else {
+      inputUrl = `rtmp://${NGINX_HOST}:${RTMP_PORT}/live/stream`;
+      console.log('Using RTMP input');
+    }
 
     // Start FFmpeg relay for each platform
     for (const platform of platforms) {
@@ -655,7 +738,15 @@ app.post('/relay/start/:platformId', async (req, res) => {
       return res.status(404).json({ error: 'Platform not found or not enabled', platformId });
     }
 
-    const inputUrl = `rtmp://${NGINX_HOST}:${RTMP_PORT}/live/stream`;
+    // Detect input protocol and build appropriate input URL
+    const inputStatus = await checkInputStatus();
+    let inputUrl;
+    if (inputStatus.protocol === 'srt') {
+      inputUrl = `srt://${NGINX_HOST}:${SRT_PORT}?streamid=read:live/stream&mode=caller`;
+    } else {
+      inputUrl = `rtmp://${NGINX_HOST}:${RTMP_PORT}/live/stream`;
+    }
+
     const ffmpegArgs = buildFFmpegArgs(platform, inputUrl, useNvenc);
 
     console.log(`Starting relay to ${platform.name}:`, ffmpegArgs.join(' ').substring(0, 100) + '...');
@@ -708,10 +799,10 @@ app.post('/relay/restart/:platformId', async (req, res) => {
 
   try {
     // Stop if running
-    const proc = relayProcesses.get(platformId);
-    if (proc && proc.process && !proc.process.killed) {
-      console.log(`Stopping relay to ${proc.platform} for restart...`);
-      proc.process.kill('SIGTERM');
+    const existingProc = relayProcesses.get(platformId);
+    if (existingProc && existingProc.process && !existingProc.process.killed) {
+      console.log(`Stopping relay to ${existingProc.platform} for restart...`);
+      existingProc.process.kill('SIGTERM');
       relayProcesses.delete(platformId);
       // Brief delay to let process die
       await new Promise(resolve => setTimeout(resolve, 500));
@@ -736,7 +827,15 @@ app.post('/relay/restart/:platformId', async (req, res) => {
       return res.status(404).json({ error: 'Platform not found or not enabled', platformId });
     }
 
-    const inputUrl = `rtmp://${NGINX_HOST}:${RTMP_PORT}/live/stream`;
+    // Detect input protocol and build appropriate input URL
+    const inputStatus = await checkInputStatus();
+    let inputUrl;
+    if (inputStatus.protocol === 'srt') {
+      inputUrl = `srt://${NGINX_HOST}:${SRT_PORT}?streamid=read:live/stream&mode=caller`;
+    } else {
+      inputUrl = `rtmp://${NGINX_HOST}:${RTMP_PORT}/live/stream`;
+    }
+
     const ffmpegArgs = buildFFmpegArgs(platform, inputUrl, useNvenc);
 
     console.log(`Restarting relay to ${platform.name}:`, ffmpegArgs.join(' ').substring(0, 100) + '...');
@@ -836,5 +935,6 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`Stream Manager listening on port ${PORT}`);
   console.log(`Dashboard URL: ${DASHBOARD_URL}`);
   console.log(`RTMP Input: rtmp://${NGINX_HOST}:${RTMP_PORT}/live/stream`);
-  console.log(`Nginx Stats: http://${NGINX_HOST}/stat`);
+  console.log(`SRT Input: srt://${NGINX_HOST}:${SRT_PORT}?streamid=live/stream`);
+  console.log(`MediaMTX API: ${MEDIAMTX_API}`);
 });

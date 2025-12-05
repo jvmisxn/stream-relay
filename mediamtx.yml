@@ -1,0 +1,66 @@
+# MediaMTX Configuration
+# Multi-protocol streaming server for RTMP and SRT input
+
+###############################################
+# General settings
+
+# Log level (debug, info, warn, error)
+logLevel: info
+logDestinations: [stdout]
+
+# Authentication - allow unauthenticated API access from Docker network
+authMethod: internal
+authInternalUsers:
+  - user: any
+    pass:
+    ips: []
+    permissions:
+      - action: api
+      - action: publish
+      - action: read
+      - action: playback
+
+###############################################
+# API settings
+
+# Enable REST API for status checks
+api: yes
+apiAddress: :9997
+
+###############################################
+# RTMP settings
+
+# Enable RTMP server (for OBS/encoder input)
+rtmp: yes
+rtmpAddress: :1935
+
+###############################################
+# SRT settings
+
+# Enable SRT server (for low-latency input)
+srt: yes
+srtAddress: :8890
+
+###############################################
+# Path configuration
+
+paths:
+  # Main streaming path - accepts both RTMP and SRT
+  live/stream:
+    source: publisher
+
+    # No authentication required for publishing
+    # (authentication handled at application level)
+    publishUser:
+    publishPass:
+
+    # No authentication required for reading
+    # (FFmpeg relay reads from here)
+    readUser:
+    readPass:
+
+    # Source timeout - how long to wait for publisher
+    sourceOnDemand: no
+
+    # Record settings (disabled)
+    record: no

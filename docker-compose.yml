@@ -1,0 +1,64 @@
+# Stream Relay - Self-Hosted Docker Setup with Auto-Tunnel
+# Usage:
+#   1. Copy .env.example to .env and fill in your settings
+#   2. Run: docker-compose up -d
+#   3. Send RTMP stream to: rtmp://your-server-ip:1935/live/stream
+#      Or SRT stream to: srt://your-server-ip:8890?streamid=publish:live/stream
+#   4. The tunnel URL auto-registers with your dashboard!
+#
+# Required env vars:
+#   - API_SECRET: Secret for relay API authentication
+#   - DASHBOARD_URL: Your dashboard URL (e.g., https://your-app.vercel.app)
+#   - RELAY_TOKEN: Your relay token from dashboard settings
+
+version: '3.8'
+
+services:
+  # Multi-protocol input server (RTMP + SRT)
+  mediamtx:
+    image: bluenviron/mediamtx:latest
+    ports:
+      - "1935:1935"      # RTMP
+      - "8890:8890/udp"  # SRT
+      - "9997:9997"      # API
+    volumes:
+      - ./mediamtx.yml:/mediamtx.yml:ro
+    restart: unless-stopped
+
+  # Stream relay service (processes and forwards to platforms)
+  stream-relay:
+    build: .
+    ports:
+      - "3001:3001"
+    environment:
+      - API_SECRET=${API_SECRET}
+      - DASHBOARD_URL=${DASHBOARD_URL:-}
+      - PORT=3001
+      - RTMP_PORT=1935
+      - SRT_PORT=8890
+      - MEDIAMTX_API=http://mediamtx:9997
+      - NGINX_HOST=mediamtx
+    depends_on:
+      - mediamtx
+    restart: unless-stopped
+    # For GPU support (NVENC), uncomment below:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  # Cloudflare Tunnel - Auto-generates a public HTTPS URL
+  # Run ./start.sh to auto-register the URL with your dashboard
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate --url http://stream-relay:3001
+    depends_on:
+      - stream-relay
+    restart: unless-stopped
+
+networks:
+  default:
+    name: stream-relay-network
